@@ -1,0 +1,68 @@
+spring:
+  application:
+    name: dwp-kafka-consumer
+
+  # MySQL (AWS RDS in production)
+  datasource:
+    url: ${MYSQL_URL:jdbc:mysql://localhost:3306/dwp?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true}
+    username: ${MYSQL_USER:dwp_user}
+    password: ${MYSQL_PASSWORD:dwp_password}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 30000
+      idle-timeout: 600000
+
+  jpa:
+    hibernate:
+      ddl-auto: validate          # never auto-create in prod — use Flyway
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+        format_sql: true
+
+  # MongoDB
+  data:
+    mongodb:
+      uri: ${MONGO_URI:mongodb://localhost:27017/dwp_events}
+      auto-index-creation: false  # manage indexes explicitly in prod
+
+# Kafka consumer configuration
+kafka:
+  bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+  consumer:
+    group-id: ${KAFKA_GROUP_ID:dwp-consumers}
+    auto-offset-reset: earliest
+    enable-auto-commit: false     # manual commit — we control exactly when we ack
+    max-poll-records: 50
+    key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    properties:
+      isolation.level: read_committed   # only read committed transactional messages
+      session.timeout.ms: 30000
+      heartbeat.interval.ms: 10000
+  listener:
+    ack-mode: MANUAL_IMMEDIATE    # ack only after successful DB write
+    concurrency: 3                # 3 listener threads = 1 per partition
+    type: batch                   # batch listener for throughput
+
+# Spring Actuator
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when_authorized
+
+server:
+  port: ${PORT:8081}
+
+logging:
+  level:
+    com.dwp: INFO
+    org.apache.kafka: WARN
+    org.springframework.kafka: INFO

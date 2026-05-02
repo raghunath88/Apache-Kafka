@@ -1,0 +1,173 @@
+version: '3.8'
+
+# Local development stack — mirrors the AWS production environment
+# Kafka (single broker), MySQL (mirrors RDS), MongoDB (mirrors Atlas), Kafka UI
+
+networks:
+  dwp-network:
+    driver: bridge
+
+volumes:
+  mysql-data:
+  mongo-data:
+  kafka-data:
+
+services:
+
+  # ── Kafka ──────────────────────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: dwp-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - dwp-network
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: dwp-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "9101:9101"  # JMX for metrics
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+      # Retention matching production settings
+      KAFKA_LOG_RETENTION_MS: 604800000
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_COMPRESSION_TYPE: lz4
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - dwp-network
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ── Kafka UI ───────────────────────────────────────────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: dwp-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local-dwp
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+      - dwp-network
+
+  # ── MySQL (mirrors AWS RDS) ────────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: dwp-mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: dwp
+      MYSQL_USER: dwp_user
+      MYSQL_PASSWORD: dwp_password
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./init/mysql-schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    networks:
+      - dwp-network
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --innodb-buffer-pool-size=256M
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "dwp_user", "-pdwp_password"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── MongoDB (mirrors Atlas replica set) ───────────────────────────────────
+  mongodb:
+    image: mongo:7.0
+    container_name: dwp-mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: mongo_user
+      MONGO_INITDB_ROOT_PASSWORD: mongo_password
+      MONGO_INITDB_DATABASE: dwp_events
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - dwp-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Producer Service ───────────────────────────────────────────────────────
+  producer:
+    build:
+      context: ../producer-service
+      dockerfile: Dockerfile
+    container_name: dwp-producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      KAFKA_BROKERS: kafka:29092
+      KAFKA_CLIENT_ID: dwp-producer
+      KAFKA_TOPIC: dwp.orders
+      PORT: 3000
+      NODE_ENV: development
+    networks:
+      - dwp-network
+
+  # ── Consumer Service ───────────────────────────────────────────────────────
+  consumer:
+    build:
+      context: ../consumer-service
+      dockerfile: Dockerfile
+    container_name: dwp-consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_GROUP_ID: dwp-consumers
+      MYSQL_URL: jdbc:mysql://mysql:3306/dwp?useSSL=false&serverTimezone=UTC
+      MYSQL_USER: dwp_user
+      MYSQL_PASSWORD: dwp_password
+      MONGO_URI: mongodb://mongo_user:mongo_password@mongodb:27017/dwp_events?authSource=admin
+      PORT: 8081
+    networks:
+      - dwp-network
