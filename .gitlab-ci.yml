@@ -1,0 +1,189 @@
+stages:
+  - build
+  - test
+  - security-scan
+  - deploy
+
+variables:
+  DOCKER_REGISTRY: $CI_REGISTRY
+  PRODUCER_IMAGE: $CI_REGISTRY_IMAGE/producer:$CI_COMMIT_SHA
+  CONSUMER_IMAGE: $CI_REGISTRY_IMAGE/consumer:$CI_COMMIT_SHA
+  DOCKER_BUILDKIT: "1"
+
+# ── BUILD ───────────────────────────────────────────────────────────────────
+
+build:producer:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker build -t $PRODUCER_IMAGE ./producer-service
+    - docker push $PRODUCER_IMAGE
+  rules:
+    - changes:
+        - producer-service/**/*
+
+build:consumer:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker build -t $CONSUMER_IMAGE ./consumer-service
+    - docker push $CONSUMER_IMAGE
+  rules:
+    - changes:
+        - consumer-service/**/*
+
+# ── TEST ────────────────────────────────────────────────────────────────────
+
+test:producer:
+  stage: test
+  image: node:18-alpine
+  script:
+    - cd producer-service
+    - npm ci
+    - npm test -- --coverage --ci
+  coverage: '/Lines\s*:\s*(\d+\.?\d*)%/'
+  artifacts:
+    reports:
+      junit: producer-service/coverage/junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: producer-service/coverage/cobertura-coverage.xml
+  rules:
+    - changes:
+        - producer-service/**/*
+
+test:consumer:
+  stage: test
+  image: maven:3.9-eclipse-temurin-17
+  services:
+    - docker:24-dind  # Testcontainers needs Docker
+  variables:
+    TESTCONTAINERS_HOST_OVERRIDE: "host.docker.internal"
+    DOCKER_HOST: "tcp://docker:2375"
+  script:
+    - cd consumer-service
+    - mvn clean verify -P ci
+  artifacts:
+    reports:
+      junit:
+        - consumer-service/target/surefire-reports/TEST-*.xml
+
+# ── SECURITY SCAN ───────────────────────────────────────────────────────────
+
+scan:trivy:producer:
+  stage: security-scan
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  script:
+    - trivy image --exit-code 1 --severity HIGH,CRITICAL --no-progress $PRODUCER_IMAGE
+  allow_failure: false
+
+scan:trivy:consumer:
+  stage: security-scan
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  script:
+    - trivy image --exit-code 1 --severity HIGH,CRITICAL --no-progress $CONSUMER_IMAGE
+  allow_failure: false
+
+scan:sast:
+  stage: security-scan
+  include:
+    - template: Security/SAST.gitlab-ci.yml
+
+# ── DEPLOY ──────────────────────────────────────────────────────────────────
+
+.deploy_template: &deploy_template
+  image: alpine:3.18
+  before_script:
+    - apk add --no-cache openssh-client bash
+    - eval $(ssh-agent -s)
+    - echo "$EC2_PRIVATE_KEY" | ssh-add -
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts
+
+deploy:producer:staging:
+  <<: *deploy_template
+  stage: deploy
+  environment:
+    name: staging
+    url: https://staging-api.dwp-kafka.internal
+  script:
+    - |
+      ssh $EC2_USER@$EC2_HOST "
+        docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+        docker pull $PRODUCER_IMAGE
+        docker stop dwp-producer || true
+        docker rm dwp-producer || true
+        docker run -d \
+          --name dwp-producer \
+          --restart unless-stopped \
+          -p 3000:3000 \
+          -e KAFKA_BROKERS=$KAFKA_BROKERS \
+          -e KAFKA_TOPIC=dwp.orders \
+          -e NODE_ENV=production \
+          $PRODUCER_IMAGE
+        sleep 10
+        docker exec dwp-producer wget -qO- http://localhost:3000/health
+      "
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+deploy:consumer:staging:
+  <<: *deploy_template
+  stage: deploy
+  environment:
+    name: staging
+  script:
+    - |
+      ssh $EC2_USER@$EC2_HOST "
+        docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+        docker pull $CONSUMER_IMAGE
+        docker stop dwp-consumer || true
+        docker rm dwp-consumer || true
+        docker run -d \
+          --name dwp-consumer \
+          --restart unless-stopped \
+          -p 8081:8081 \
+          -e KAFKA_BOOTSTRAP_SERVERS=$KAFKA_BROKERS \
+          -e MYSQL_URL=$MYSQL_URL \
+          -e MYSQL_USER=$MYSQL_USER \
+          -e MYSQL_PASSWORD=$MYSQL_PASSWORD \
+          -e MONGO_URI=$MONGO_URI \
+          $CONSUMER_IMAGE
+        sleep 20
+        docker exec dwp-consumer wget -qO- http://localhost:8081/actuator/health
+      "
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+deploy:production:
+  <<: *deploy_template
+  stage: deploy
+  environment:
+    name: production
+    url: https://api.dwp-kafka.internal
+  script:
+    - bash scripts/health-check.sh
+    - |
+      echo "Rolling deploy to production..."
+      # In a real setup: update ECS task definitions or ASG launch templates
+      ssh $EC2_USER@$EC2_PROD_HOST "
+        docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+        docker pull $PRODUCER_IMAGE && docker pull $CONSUMER_IMAGE
+        docker-compose -f /opt/dwp/docker-compose.prod.yml up -d \
+          --no-deps \
+          --timeout 60 \
+          producer consumer
+      "
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  when: manual  # require explicit approval for prod deploys
